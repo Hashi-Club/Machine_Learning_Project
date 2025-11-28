@@ -5,7 +5,7 @@
 本框架提供：数据加载、策略接口/示例策略、回测引擎、绩效指标计算以及港股手续费模型集成。
 
 ```bash
-python .\test_scripts\backtest_framework.py --file data/data_with_indicators.txt --start 2024-01-01 --end 2025-04-24 --strategies ma_cross rsi_reversion boll_breakout buy_hold --apply-fees --capital 100000 --fee-package fixed --max-position 1.0 --output different_methods_with_fees.csv
+python .\test_scripts\backtest_framework.py --file data/data_with_indicators.txt --start 2024-01-01 --end 2025-04-24 --strategies ma_cross rsi_reversion boll_breakout buy_hold --apply-fees --capital 100000 --max-position 1.0
 ```
 
 ## 目录索引
@@ -16,7 +16,7 @@ python .\test_scripts\backtest_framework.py --file data/data_with_indicators.txt
 - 示例策略: `MovingAverageCross`, `RSIReversion`, `BollingerBreakout`
 - 回测主函数: `run_backtest()`
 - 指标计算: `compute_metrics()`
-- 港股费用计算: `compute_hk_fees()`, `_tiered_platform_fee()`, `compute_negative_cash_interest()`
+- 港股费用计算: `compute_hk_fees()`
 - CLI 入口与参数: `parse_args()` / `main()`
 
 ---

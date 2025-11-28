@@ -1,12 +1,20 @@
 from __future__ import annotations
 import argparse
-from dataclasses import dataclass
 from pathlib import Path
 from typing import List, Dict, Optional
 import pandas as pd
 import numpy as np
 import math
 
+# Import Strategy Base and Concrete Strategies
+try:
+    from .strategy_base import Strategy, StrategyResult
+    from .basic_strategies import MovingAverageCross, RSIReversion, BollingerBreakout, BuyAndHold, MACDStrategy
+    from .ml_strategies import XGBoostStrategy
+except ImportError:
+    from strategy_base import Strategy, StrategyResult
+    from basic_strategies import MovingAverageCross, RSIReversion, BollingerBreakout, BuyAndHold, MACDStrategy
+    from ml_strategies import XGBoostStrategy
 
 # ============================= Data Loading =============================
 def load_price_data(path: Path) -> pd.DataFrame:
@@ -22,102 +30,13 @@ def load_price_data(path: Path) -> pd.DataFrame:
     return df
 
 
-# ============================= Strategy Base =============================
-@dataclass
-class StrategyResult:
-    name: str
-    metrics: Dict[str, float]
-    equity: pd.Series
-    positions: pd.Series
-    trades: pd.DataFrame
-
-
-class Strategy:
-    name: str = "Base"
-
-    def generate_positions(self, df: pd.DataFrame) -> pd.Series:
-        """返回每日持仓权重 ([-1, 1] 浮点)，index 与 df 一致。"""
-        raise NotImplementedError
-
-
-# ============================= Concrete Strategies =============================
-class MovingAverageCross(Strategy):
-    name = "ma_cross"
-
-    def __init__(self, fast: int = 5, slow: int = 20):
-        self.fast = fast
-        self.slow = slow
-
-    def generate_positions(self, df: pd.DataFrame) -> pd.Series:
-        close = df['close']
-        fast_ma = close.rolling(self.fast, min_periods=1).mean()
-        slow_ma = close.rolling(self.slow, min_periods=1).mean()
-        signal = (fast_ma > slow_ma).astype(int)
-        return signal
-
-
-class RSIReversion(Strategy):
-    name = "rsi_reversion"
-
-    def __init__(self, period: int = 14, low: float = 30.0, high: float = 70.0):
-        self.period = period
-        self.low = low
-        self.high = high
-
-    def generate_positions(self, df: pd.DataFrame) -> pd.Series:
-        # 如果已有 rsi14 列，复用；否则计算
-        if 'rsi14' in df.columns and df['rsi14'].notna().any() and self.period == 14:
-            rsi = df['rsi14']
-        else:
-            close = df['close']
-            delta = close.diff()
-            gain = delta.clip(lower=0).rolling(self.period).mean()
-            loss = (-delta.clip(upper=0)).rolling(self.period).mean()
-            rs = gain / (loss.replace(0, np.nan))
-            rsi = 100 - (100 / (1 + rs))
-        pos = pd.Series(0, index=df.index)
-        pos[rsi < self.low] = 1
-        pos[rsi > self.high] = 0
-        return pos.ffill().fillna(0)
-
-
-class BollingerBreakout(Strategy):
-    name = "boll_breakout"
-
-    def __init__(self, period: int = 20, num_std: float = 2.0):
-        self.period = period
-        self.num_std = num_std
-
-    def generate_positions(self, df: pd.DataFrame) -> pd.Series:
-        close = df['close']
-        if all(c in df.columns for c in ['boll_mid', 'boll_upper', 'boll_lower']):
-            mid = df['boll_mid']
-            upper = df['boll_upper']
-            lower = df['boll_lower']
-        else:
-            mid = close.rolling(self.period, min_periods=1).mean()
-            std = close.rolling(self.period, min_periods=1).std()
-            upper = mid + self.num_std * std
-            lower = mid - self.num_std * std
-        signal = pd.Series(0, index=df.index)
-        signal[close > upper] = 1  # 突破做多
-        signal[close < lower] = 0  # 跌破下轨清仓
-        return signal.ffill().fillna(0)
-
-
-class BuyAndHold(Strategy):
-    name = "buy_hold"
-
-    def generate_positions(self, df: pd.DataFrame) -> pd.Series:
-        # 始终持有，权重为 1
-        return pd.Series(1.0, index=df.index)
-
-
 STRATEGY_MAP = {
+    'buy_hold': BuyAndHold,
     'ma_cross': MovingAverageCross,
     'rsi_reversion': RSIReversion,
     'boll_breakout': BollingerBreakout,
-    'buy_hold': BuyAndHold,
+    'macd': MACDStrategy,
+    'xgboost': XGBoostStrategy,
 }
 
 
@@ -127,9 +46,6 @@ def run_backtest(
     strategy: Strategy,
     apply_fees: bool = False,
     capital: float = 100000.0,
-    fee_package: str = 'fixed',
-    instrument_type: str = 'stock',
-    commission_free: bool = False,
     max_position: float = 1.0,
 ) -> StrategyResult:
     """运行单策略回测，支持可选港股手续费扣除。
@@ -137,6 +53,7 @@ def run_backtest(
     持仓支持部分仓位：策略返回 -max_position~max_position 之间的浮点权重。
     手续费按交易金额计算，并转换为对总资本的收益影响。
     """
+    # 1. 准备数据
     raw_positions = strategy.generate_positions(df).astype(float)
     positions = raw_positions.reindex(df.index).fillna(0.0)
     max_abs = abs(max_position)
@@ -144,76 +61,146 @@ def run_backtest(
         raise ValueError('max_position 必须为正数')
     positions = positions.clip(lower=-max_abs, upper=max_abs)
     close = df['close']
-    daily_ret = close.pct_change().fillna(0)
-    strat_ret = daily_ret * positions.shift(1).fillna(0)
 
+    # 2. 初始化回测状态
+    actual_positions = pd.Series(0.0, index=df.index) # 实际持仓权重 (基于手数)
     fee_series = pd.Series(0.0, index=df.index)
     trades = []
-    current_pos = 0.0
+    
+    current_shares = 0 # 当前持股数 (股)
+    current_cash = capital # 当前现金（名义资金，随交易与手续费变动）
     avg_entry_price: Optional[float] = None
-    # 统计当月订单数（用于阶梯式平台费）: month -> count
     month_order_counts: Dict[pd.Timestamp, int] = {}
+    
+    prev_signal_weight = 0.0 # 上一时刻的信号权重
 
-    # diff 首行 NaN 代表首次持仓，直接用原值替代
-    pos_change = positions.diff().fillna(positions.iloc[0])
-    trade_dates = pos_change[pos_change != 0].index
-    for dt in trade_dates:
-        change = pos_change.loc[dt]
-        if change == 0:
-            continue
-        month_start = pd.Timestamp(dt.year, dt.month, 1)
-        prev_count = month_order_counts.get(month_start, 0)
-        new_pos = current_pos + change
-        trade_type = 'BUY' if change > 0 else 'SELL'
-        trade_amount = abs(change) * capital
-
-        price_today = close.loc[dt]
-        trade_record = {
-            'date': dt,
-            'type': trade_type,
-            'price': price_today,
-            'weight_change': float(change),
-            'target_weight': float(new_pos),
-        }
-
-        if change > 0:
-            if current_pos <= 0 or avg_entry_price is None:
-                avg_entry_price = price_today
+    # 3. 逐日迭代 (模拟交易)
+    for dt in df.index:
+        price = close.loc[dt]
+        signal_weight = positions.loc[dt]
+        
+        # 检查信号是否发生变化 (使用小容差处理浮点数)
+        # 注意：这里假设策略信号变化才触发调仓，而不是每天根据价格波动再平衡
+        if abs(signal_weight - prev_signal_weight) > 1e-6:
+            # 计算目标持仓（不允许做空）：正信号 -> 目标为非负仓位；非正信号 -> 清仓
+            if signal_weight > 0:
+                # 目标是尽可能接近权重 signal_weight * capital 的仓位，但受现金与手续费约束
+                target_val = signal_weight * capital
+                # 初步目标股数（整手）
+                prelim_shares = math.floor((target_val / price) / 100) * 100
+                # 受现金约束的可买股数（整手）：考虑手续费后不超过 current_cash
+                # 使用二分查找最大整手可买
+                low, high = 0, max(prelim_shares, 0)
+                max_affordable = 0
+                while low <= high:
+                    mid = (low + high) // 2
+                    amount = mid * price
+                    fees_total = compute_hk_fees(amount=amount, date=dt)['total_fee'] if apply_fees else 0.0
+                    total_cost = amount + fees_total
+                    if total_cost <= current_cash:
+                        max_affordable = mid
+                        low = mid + 100
+                    else:
+                        high = mid - 100
+                target_shares = int(max_affordable)
             else:
-                total_weight = current_pos + change
-                if total_weight > 0:
-                    avg_entry_price = (avg_entry_price * current_pos + price_today * change) / total_weight
-            trade_record['avg_entry_price'] = avg_entry_price
-        else:
-            if avg_entry_price is not None and current_pos != 0:
-                realized_pct = price_today / avg_entry_price - 1
-                trade_record['pnl_pct'] = realized_pct
-            if new_pos <= 0:
-                avg_entry_price = None
+                target_shares = 0
 
-        trades.append(trade_record)
+            # 计算需要交易的股数（不允许卖出超过当前持股，不做空）
+            desired_diff = target_shares - current_shares
+            if desired_diff > 0:
+                # 买入：按整手，且不超过现金能买的最大股数
+                buy_amount = desired_diff * price
+                fees_total = compute_hk_fees(amount=buy_amount, date=dt)['total_fee'] if apply_fees else 0.0
+                total_cost = buy_amount + fees_total
+                if total_cost > current_cash:
+                    # 进一步缩减购买股数直到可支付
+                    # 由于手续费随金额近似线性增长，按整手递减
+                    reduce = desired_diff
+                    while reduce > 0:
+                        test_shares = reduce
+                        test_amount = test_shares * price
+                        test_fees = compute_hk_fees(amount=test_amount, date=dt)['total_fee'] if apply_fees else 0.0
+                        if test_amount + test_fees <= current_cash:
+                            desired_diff = test_shares
+                            break
+                        reduce -= 100
+                    else:
+                        desired_diff = 0
+            else:
+                # 卖出：最多卖到0股
+                desired_diff = max(desired_diff, -current_shares)
 
-        if apply_fees and trade_amount > 0:
-            fees = compute_hk_fees(
-                amount=trade_amount,
-                order_count_this_month=prev_count,
-                instrument_type=instrument_type,
-                date=dt,
-                package=fee_package,
-                commission_free=commission_free,
-            )
-            fee_series.loc[dt] -= fees['total_fee'] / capital
+            diff_shares = desired_diff
+            if diff_shares != 0:
+                trade_val = abs(diff_shares) * price
+                trade_type = 'BUY' if diff_shares > 0 else 'SELL'
+                month_start = pd.Timestamp(dt.year, dt.month, 1)
+                prev_count = month_order_counts.get(month_start, 0)
+                trade_record = {
+                    'date': dt,
+                    'type': trade_type,
+                    'price': price,
+                    'shares': float(diff_shares),
+                    'amount': float(trade_val),
+                    'target_shares': float(target_shares),
+                }
 
-        month_order_counts[month_start] = prev_count + 1
-        current_pos = new_pos
+                # 手续费并更新现金
+                fees_total = compute_hk_fees(amount=trade_val, date=dt)['total_fee'] if apply_fees else 0.0
+                if diff_shares > 0:
+                    # 买入支付现金
+                    total_cost = trade_val + fees_total
+                    current_cash -= total_cost
+                else:
+                    # 卖出收回现金（卖出也可能产生费用，这里费用从收益中扣，现金收到净额）
+                    current_cash += (trade_val - fees_total)
 
+                # 费用影响加入收益序列（基于名义 capital）
+                if apply_fees and fees_total > 0:
+                    fee_series.loc[dt] -= fees_total / capital
+
+                # 更新均价与记录
+                if diff_shares > 0: # 买入
+                    if current_shares <= 0 or avg_entry_price is None:
+                        avg_entry_price = price
+                    else:
+                        total_shares = current_shares + diff_shares
+                        if total_shares > 0:
+                            avg_entry_price = (avg_entry_price * current_shares + price * diff_shares) / total_shares
+                    trade_record['avg_entry_price'] = avg_entry_price
+                else: # 卖出
+                    if avg_entry_price is not None and current_shares != 0:
+                        realized_pct = price / avg_entry_price - 1
+                        trade_record['pnl_pct'] = realized_pct
+                    if target_shares <= 0:
+                        avg_entry_price = None
+
+                trades.append(trade_record)
+                month_order_counts[month_start] = prev_count + 1
+                current_shares += diff_shares
+
+            prev_signal_weight = signal_weight
+        
+        # 更新当日实际持仓权重 (用于计算次日收益)
+        # 权重 = (持股数 * 当前价格) / 初始资金
+        # 注意：这里使用初始资金作为分母，意味着不复利再投资 (Simple Return on Capital)
+        # 如果希望模拟复利，分母应为当前权益，但这会引入循环依赖。
+        # 鉴于 capital 是名义资金，这种做法是标准的回测简化。
+        actual_positions.loc[dt] = (current_shares * price) / capital
+
+    # 4. 计算收益指标
+    daily_ret = close.pct_change().fillna(0)
+    # 策略收益 = 每日收益率 * 昨日持仓权重
+    strat_ret = daily_ret * actual_positions.shift(1).fillna(0)
+    
     # 结合手续费后的策略收益
     net_returns = strat_ret + fee_series  # fee_series 为负值
     equity = (1 + net_returns).cumprod()
     trades_df = pd.DataFrame(trades)
 
     metrics = compute_metrics(net_returns, equity, trades_df)
-    return StrategyResult(name=strategy.name, metrics=metrics, equity=equity, positions=positions, trades=trades_df)
+    return StrategyResult(name=strategy.name, metrics=metrics, equity=equity, positions=actual_positions, trades=trades_df)
 
 
 # ============================= Metrics =============================
@@ -243,77 +230,39 @@ def compute_metrics(returns: pd.Series, equity: pd.Series, trades: pd.DataFrame)
 
 
 # ============================= HK Fees Calculation =============================
-def _tiered_platform_fee(order_count_this_month: int) -> float:
-    """阶梯式平台使用费单笔费用."""
-    tiers = [
-        (5, 30), (20, 15), (50, 10), (100, 9), (500, 8), (1000, 7),
-        (2000, 6), (3000, 5), (4000, 4), (5000, 3), (6000, 2)
-    ]
-    for limit, fee in tiers:
-        if order_count_this_month <= limit:
-            return float(fee)
-    return 1.0  # 6001 及以上
-
-
 def compute_hk_fees(amount: float,
-                    order_count_this_month: int,
-                    instrument_type: str = 'stock',
-                    date: Optional[pd.Timestamp] = None,
-                    package: str = 'fixed',
-                    commission_free: bool = False) -> Dict[str, float]:
-    """计算港股单笔订单所有费用.
+                    date: Optional[pd.Timestamp] = None) -> Dict[str, float]:
+    """计算港股单笔订单所有费用 (仅股票, 固定费率).
 
     参数:
         amount: 成交金额 (成交价 * 股数)
-        order_count_this_month: 当前自然月累计订单数 (含本单之前?) 传入本单之前的数量用于阶梯计算
-        instrument_type: 'stock' | 'etf' | 'warrant' | 'cbbc' | 'other'
         date: 交易日期, 用于判断某些费用是否生效 (系统使用费取消时间等)
-        package: 'fixed' 固定式15港元 / 'tiered' 阶梯式
-        commission_free: 免佣期内 True 则佣金为0
 
     返回: dict 各项费用与总额 total_fee
     """
     if date is None:
         date = pd.Timestamp.today()
 
-    # 佣金: 0.03% * amount, 最低 3 HKD
-    if commission_free:
-        commission = 0.0
-    else:
-        commission_raw = amount * 0.0003
-        commission = max(3.0, commission_raw)
+    # 1. 佣金: 0.03% * amount, 最低 3 HKD
+    commission = max(3.0, amount * 0.0003)
 
-    # 平台使用费
-    if package == 'fixed':
-        platform_fee = 15.0
-    elif package == 'tiered':
-        # 本单属于下一序号, 所以用 (order_count_this_month + 1) 判断档位
-        platform_fee = _tiered_platform_fee(order_count_this_month + 1)
-    else:
-        raise ValueError('package 必须为 fixed 或 tiered')
+    # 2. 平台使用费: 固定 15 HKD
+    platform_fee = 15.0
 
-    # 系统使用费: 每次成交0.50港元 (2023-01-01 起取消)
+    # 3. 系统使用费: 2023-01-01 起取消
     sys_fee = 0.5 if date < pd.Timestamp('2023-01-01') else 0.0
 
+    # 4. 印花税 (股票): 0.1% * amount, 向上取整, 最低 1 HKD
+    stamp_duty = max(1.0, math.ceil(amount * 0.001))
+
+    # 5. 其他杂费 (结算 + 交易 + 证监会 + 财汇局)
     # 结算交收费 0.0042%
     settlement_fee = amount * 0.000042
-
-    # 印花税: 股票 0.1% * amount, 向上取整到整数港元, 最低1; ETF/窝轮/牛熊证免除
-    if instrument_type.lower() in {'etf', 'warrant', 'cbbc'}:
-        stamp_duty = 0.0
-    else:
-        stamp_raw = amount * 0.001  # 0.1%
-        stamp_duty = max(1.0, math.ceil(stamp_raw))
-
-    # 交易费 0.00565% 最低0.01
-    trading_fee_raw = amount * 0.0000565
-    trading_fee = max(0.01, trading_fee_raw)
-
-    # 证监会交易征费 0.0027% 最低0.01
-    sfc_levy_raw = amount * 0.000027
-    sfc_levy = max(0.01, sfc_levy_raw)
-
-    # 财务汇报局征费 0.00015% 无最低说明, 常规四舍五入
+    # 交易费 0.00565% (min 0.01)
+    trading_fee = max(0.01, amount * 0.0000565)
+    # 证监会征费 0.0027% (min 0.01)
+    sfc_levy = max(0.01, amount * 0.000027)
+    # 财汇局征费 0.00015%
     frc_levy = amount * 0.0000015
 
     # 汇总
@@ -321,8 +270,8 @@ def compute_hk_fees(amount: float,
         'commission': round(commission, 2),
         'platform_fee': round(platform_fee, 2),
         'system_fee': round(sys_fee, 2),
-        'settlement_fee': round(settlement_fee, 2),
         'stamp_duty': round(stamp_duty, 2),
+        'settlement_fee': round(settlement_fee, 2),
         'trading_fee': round(trading_fee, 2),
         'sfc_levy': round(sfc_levy, 2),
         'frc_levy': round(frc_levy, 4),
@@ -330,28 +279,16 @@ def compute_hk_fees(amount: float,
     fees['total_fee'] = round(sum(fees.values()), 2)
     return fees
 
-
-def compute_negative_cash_interest(negative_cash: float, days: int, annual_rate: float = 0.068) -> float:
-    """负现金日利息: 单利 = 负现金 * 年利率/365 * 天数."""
-    if negative_cash >= 0:
-        return 0.0
-    interest = (-negative_cash) * annual_rate / 365.0 * days
-    return round(interest, 2)
-
-
 # ============================= CLI Runner =============================
 def parse_args():
     p = argparse.ArgumentParser(description='多策略回测框架')
     p.add_argument('--file', default='data/data_with_indicators.txt', help='数据文件路径 (含OHLC)')
-    p.add_argument('--start', help='起始日期 YYYY-MM-DD')
-    p.add_argument('--end', help='结束日期 YYYY-MM-DD')
-    p.add_argument('--strategies', nargs='+', default=['ma_cross', 'rsi_reversion', 'boll_breakout'], help='策略名称列表')
+    p.add_argument('--start', default='2024-01-01', help='起始日期 YYYY-MM-DD')
+    p.add_argument('--end', default='2025-04-24', help='结束日期 YYYY-MM-DD')
+    p.add_argument('--strategies', nargs='+', default=list(STRATEGY_MAP.keys()), help='策略名称列表')
     p.add_argument('--output', help='结果保存CSV文件名')
     p.add_argument('--apply-fees', action='store_true', help='启用港股手续费扣除')
     p.add_argument('--capital', type=float, default=100000.0, help='名义资金（用于手续费金额计算）')
-    p.add_argument('--fee-package', choices=['fixed', 'tiered'], default='fixed', help='平台使用费套餐类型')
-    p.add_argument('--instrument-type', choices=['stock', 'etf', 'warrant', 'cbbc', 'other'], default='stock', help='产品类型决定印花税等')
-    p.add_argument('--commission-free', action='store_true', help='免佣期：佣金设为0')
     p.add_argument('--max-position', type=float, default=1.0, help='持仓权重上限（绝对值）')
     return p.parse_args()
 
@@ -376,14 +313,14 @@ def main():
             print(f"跳过未知策略: {name}")
             continue
         strat = STRATEGY_MAP[name]()
+        # 调用 prepare 方法 (如果需要)
+        strat.prepare(str(path))
+        
         res = run_backtest(
             df,
             strat,
             apply_fees=args.apply_fees,
             capital=args.capital,
-            fee_package=args.fee_package,
-            instrument_type=args.instrument_type,
-            commission_free=args.commission_free,
             max_position=args.max_position,
         )
         results.append(res)

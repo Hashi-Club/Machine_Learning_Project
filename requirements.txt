@@ -2,3 +2,5 @@ pandas_ta
 mplfinance
 matplotlib
 pandas
+yfinance
+backtrader
