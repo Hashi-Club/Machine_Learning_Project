@@ -8,14 +8,12 @@ import math
 import backtrader as bt
 
 # Import Strategy Base and Concrete Strategies
-try:
-    from .strategy_base import Strategy
-    from .basic_strategies import MovingAverageCross, RSIReversion, BollingerBreakout, BuyAndHold, MACDStrategy
-    from .ml_strategies import XGBoostStrategy
-except ImportError:
-    from strategy_base import Strategy
-    from basic_strategies import MovingAverageCross, RSIReversion, BollingerBreakout, BuyAndHold, MACDStrategy
-    from ml_strategies import XGBoostStrategy
+
+from strategy_base import Strategy
+from basic_strategies import MovingAverageCross, RSIReversion, BollingerBreakout, BuyAndHold, MACDStrategy
+from ml_strategies import RandomForestStrategy
+from LSTM import LSTMStrategy
+from xgboost_strategy import XGBoostStrategy
 
 # ============================= Data Loading =============================
 def load_price_data(path: Path) -> pd.DataFrame:
@@ -32,11 +30,13 @@ def load_price_data(path: Path) -> pd.DataFrame:
 
 STRATEGY_MAP = {
     'buy_hold': BuyAndHold,
-    'ma_cross': MovingAverageCross,
-    'rsi_reversion': RSIReversion,
-    'boll_breakout': BollingerBreakout,
-    'macd': MACDStrategy,
+    # 'ma_cross': MovingAverageCross,
+    # 'rsi_reversion': RSIReversion,
+    # 'boll_breakout': BollingerBreakout,
+    # 'macd': MACDStrategy,
     'xgboost': XGBoostStrategy,
+    # 'random_forest': RandomForestStrategy,
+    # 'lstm': LSTMStrategy,
 }
 
 # ============================= Backtrader Classes =============================
@@ -92,15 +92,15 @@ class VectorizedSignalStrategy(bt.Strategy):
     def __init__(self):
         self.signal = self.data.signal
 
-    # def notify_order(self, order):
-    #     if order.status in [order.Completed]:
-    #         # 仅在 verbose 模式或调试时打印，这里为了回答用户问题默认打印关键交易
-    #         # 为了避免输出过多，可以只打印第一笔和最后一笔，或者全部打印
-    #         # 鉴于交易次数不多，全部打印
-    #         dt = bt.num2date(order.executed.dt).date()
-    #         print(f"[{dt}] {order.data._name} {'BUY' if order.isbuy() else 'SELL'} "
-    #               f"Size: {order.executed.size:.2f} @ {order.executed.price:.4f} "
-    #               f"Comm: {order.executed.comm:.2f} Cost: {order.executed.value:.2f}")
+    def notify_order(self, order):
+        if order.status in [order.Completed]:
+            # 仅在 verbose 模式或调试时打印，这里为了回答用户问题默认打印关键交易
+            # 为了避免输出过多，可以只打印第一笔和最后一笔，或者全部打印
+            # 鉴于交易次数不多，全部打印
+            dt = bt.num2date(order.executed.dt).date()
+            print(f"[{dt}] {order.data._name} {'BUY' if order.isbuy() else 'SELL'} "
+                  f"Size: {order.executed.size:.2f} @ {order.executed.price:.4f} "
+                  f"Comm: {order.executed.comm:.2f} Cost: {order.executed.value:.2f}")
 
     def next(self):
         # 获取当前信号权重
@@ -112,6 +112,11 @@ class VectorizedSignalStrategy(bt.Strategy):
         # 计算目标市值
         target_value = self.broker.getvalue() * target_weight
         
+        # 预留手续费缓冲 (港股印花税0.1% + 佣金等，大资金时取整剩下的钱可能不够)
+        # 如果是做多，预留 0.5% 的资金
+        if target_weight > 0:
+            target_value *= 0.995
+
         # 获取当前价格
         price = self.data.close[0]
         
@@ -166,7 +171,7 @@ def run_backtest(
         # 否则 Backtrader 默认为期货模式，导致资产计算和下单逻辑差异
         cerebro.broker.setcommission(commission=0.0, stocklike=True)
         
-    cerebro.addanalyzer(bt.analyzers.SharpeRatio, _name='sharpe', riskfreerate=0.0, annualize=True)
+    cerebro.addanalyzer(bt.analyzers.SharpeRatio, _name='sharpe', riskfreerate=0.04, annualize=True)
     cerebro.addanalyzer(bt.analyzers.DrawDown, _name='drawdown')
     cerebro.addanalyzer(bt.analyzers.Returns, _name='returns')
     cerebro.addanalyzer(bt.analyzers.TradeAnalyzer, _name='trades')

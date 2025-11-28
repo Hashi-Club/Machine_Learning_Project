@@ -5,8 +5,9 @@ try:
 except ImportError:
     from strategy_base import Strategy
 
-class XGBoostStrategy(Strategy):
-    name = "xgboost"
+
+class RandomForestStrategy(Strategy):
+    name = "random_forest"
 
     def __init__(self):
         self.model = None
@@ -18,22 +19,22 @@ class XGBoostStrategy(Strategy):
             'boll_upper', 'boll_lower',
             'atr14'
         ]
-        self.lags = 5
-        self.cols_to_lag = ['close', 'volume', 'rsi14', 'macd_bar']
+        self.lags = 3  # RF might overfit with too many lags, keep it smaller
+        self.cols_to_lag = ['close', 'volume', 'rsi14']
         self.full_df = None
         self.feature_names = []
 
     def prepare(self, data_path: str):
         try:
-            import xgboost as xgb
+            from sklearn.ensemble import RandomForestClassifier
         except ImportError:
-            print("Error: xgboost not installed. Please run 'pip install xgboost'.")
+            print("Error: scikit-learn not installed. Please run 'pip install scikit-learn'.")
             return
 
         print(f"[{self.name}] Loading data for training from {data_path}...")
         df = pd.read_csv(data_path, sep='\t', parse_dates=['date'])
         df.set_index('date', inplace=True)
-        self.full_df = df.copy() # Keep full data for feature engineering context
+        self.full_df = df.copy()
 
         # Feature Engineering
         train_df = self._engineer_features(df.copy())
@@ -43,8 +44,7 @@ class XGBoostStrategy(Strategy):
         train_df['target'] = (train_df['close'].shift(-1) > train_df['close']).astype(int)
         train_df.dropna(inplace=True)
 
-        # Split for training (Fixed split as per 1.py logic)
-        # Train on 2018-2023
+        # Split for training
         train_data = train_df[train_df.index < '2024-01-01']
         
         if train_data.empty:
@@ -54,27 +54,19 @@ class XGBoostStrategy(Strategy):
         X_train = train_data[self.feature_names]
         y_train = train_data['target']
 
-        print(f"[{self.name}] Training XGBoost model on {len(X_train)} samples...")
-        self.model = xgb.XGBClassifier(
-            n_estimators=100,
-            learning_rate=0.1,
-            max_depth=5,
-            subsample=0.8,
-            colsample_bytree=0.8,
+        print(f"[{self.name}] Training Random Forest model on {len(X_train)} samples...")
+        self.model = RandomForestClassifier(
+            n_estimators=200,
+            max_depth=10,
+            min_samples_split=10,
+            min_samples_leaf=5,
             random_state=42,
-            eval_metric='logloss'
+            n_jobs=-1
         )
         self.model.fit(X_train, y_train)
         print(f"[{self.name}] Training complete.")
 
     def _engineer_features(self, df: pd.DataFrame) -> pd.DataFrame:
-        # Base features must exist
-        missing = [f for f in self.features if f not in df.columns]
-        if missing:
-            # Try to compute missing indicators if possible, or warn
-            # For now assume they exist as per data_with_indicators.txt
-            pass
-        
         feature_list = self.features.copy()
         
         # Lag features
@@ -99,29 +91,18 @@ class XGBoostStrategy(Strategy):
         if self.model is None:
             return pd.Series(0, index=df.index)
 
-        # We need context for lag features. 
-        # If self.full_df is available, use it to generate features for the requested dates.
         if self.full_df is not None:
-            # Use full_df to generate features, then slice
             full_feat = self._engineer_features(self.full_df.copy())
-            # Align with requested df
-            # We need to predict for the dates in df
-            # But be careful: we need features at time T to predict T+1 return (signal for T)
-            
-            # Filter for the relevant dates
-            # We need to ensure we have data for the requested index
             valid_indices = df.index.intersection(full_feat.index)
             X_test = full_feat.loc[valid_indices, self.feature_names]
             
-            # Predict
-            # predict_proba returns [prob_0, prob_1]
+            # Predict probability
             probs = self.model.predict_proba(X_test)[:, 1]
             
-            # Signal logic: > 0.6 -> 1 (Buy/Hold), else 0
-            # Increased threshold from 0.55 to 0.6 to account for transaction fees
-            signals = (probs > 0.5).astype(int)
+            # Signal logic: > 0.55 (Slightly higher confidence for RF)
+            signals = (probs > 0.55).astype(int)
             
             return pd.Series(signals, index=valid_indices).reindex(df.index).fillna(0)
         else:
-            # Fallback if prepare wasn't called (shouldn't happen if framework is updated)
             return pd.Series(0, index=df.index)
+

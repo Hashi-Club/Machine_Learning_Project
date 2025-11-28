@@ -5,6 +5,7 @@ try:
 except ImportError:
     from strategy_base import Strategy
 
+
 class XGBoostStrategy(Strategy):
     name = "xgboost"
 
@@ -117,8 +118,7 @@ class XGBoostStrategy(Strategy):
             # predict_proba returns [prob_0, prob_1]
             probs = self.model.predict_proba(X_test)[:, 1]
             
-            # Signal logic: > 0.6 -> 1 (Buy/Hold), else 0
-            # Increased threshold from 0.55 to 0.6 to account for transaction fees
+            # Signal logic: > 0.5 -> 1 (Buy/Hold), else 0
             signals = (probs > 0.5).astype(int)
             
             return pd.Series(signals, index=valid_indices).reindex(df.index).fillna(0)
