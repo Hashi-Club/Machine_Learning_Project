@@ -93,6 +93,21 @@ class HKCommission(bt.CommInfoBase):
         total = commission + platform_fee + sys_fee + stamp_duty + settlement_fee + trading_fee + sfc_levy + frc_levy
         return total
 
+class HKStockBroker(bt.BackBroker):
+    """
+    自定义 Broker，强制执行每手 100 股的限制
+    """
+    def submit(self, order, check=True):
+        original_size = order.size
+        # 强制每手 100 股
+        if abs(original_size) < 100:
+            order.size = 0 
+        else:
+            # 向下取整到 100 的倍数 (保留符号)
+            order.size = int(original_size / 100) * 100
+            
+        return super().submit(order, check=check)
+
 # ============================= 回测引擎 =============================
 
 def run_backtest(
@@ -105,6 +120,7 @@ def run_backtest(
 ) -> Dict:
     
     cerebro = bt.Cerebro()
+    cerebro.broker = HKStockBroker() # 使用自定义 Broker
     
     # 使用 MLData 以包含所有可能的列
     data = MLData(
@@ -156,8 +172,17 @@ def run_backtest(
     metrics['trade_count'] = total_trades
     metrics['win_rate'] = round(won_trades / total_trades, 6) if total_trades > 0 else 0.0
     
-    metrics['avg_trade_return'] = 0.0 
-    metrics['total_commission'] = 0.0
+    # 修复 avg_trade_return
+    # 使用净利润 (Net PnL) 的平均值
+    pnl_net = trade_analyzer.get('pnl', {}).get('net', {})
+    metrics['avg_trade_return'] = round(pnl_net.get('average', 0.0), 2)
+    
+    # 修复 total_commission
+    # 计算公式: 总毛利 (Gross) - 总净利 (Net)
+    pnl_gross = trade_analyzer.get('pnl', {}).get('gross', {})
+    total_gross = pnl_gross.get('total', 0.0)
+    total_net = pnl_net.get('total', 0.0)
+    metrics['total_commission'] = round(total_gross - total_net, 2)
     
     timereturn_analyzer = strat_result.analyzers.timereturn.get_analysis()
     returns_series = pd.Series(timereturn_analyzer)

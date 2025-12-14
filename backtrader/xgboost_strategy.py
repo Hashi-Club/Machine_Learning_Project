@@ -5,7 +5,33 @@ import numpy as np
 class XGBoostStrategy(bt.Strategy):
     params = (
         ('models', []),
+        ('print_log', True),
     )
+
+    def log(self, txt, dt=None):
+        """Logging function for this strategy"""
+        if self.params.print_log:
+            dt = dt or self.datas[0].datetime.date(0)
+            print(f'{dt.isoformat()}, {txt}')
+
+    def notify_order(self, order):
+        if order.status in [order.Submitted, order.Accepted]:
+            return
+
+        if order.status in [order.Completed]:
+            if order.isbuy():
+                self.log(f'BUY EXECUTED, Price: {order.executed.price:.2f}, Cost: {order.executed.value:.2f}, Comm: {order.executed.comm:.2f}')
+            elif order.issell():
+                self.log(f'SELL EXECUTED, Price: {order.executed.price:.2f}, Cost: {order.executed.value:.2f}, Comm: {order.executed.comm:.2f}')
+
+        elif order.status in [order.Canceled, order.Margin, order.Rejected]:
+            # self.log('Order Canceled/Margin/Rejected')
+            pass
+
+    def notify_trade(self, trade):
+        if not trade.isclosed:
+            return
+        # self.log(f'OPERATION PROFIT, GROSS {trade.pnl:.2f}, NET {trade.pnlcomm:.2f}')
 
     def next(self):
         if not self.params.models:
@@ -52,12 +78,32 @@ class XGBoostStrategy(bt.Strategy):
             avg_prob += model.predict_proba(X)[0, 1]
         avg_prob /= len(self.params.models)
         
-        if not self.position:
-            if avg_prob > 0.55:
-                self.order_target_percent(target=0.99)
-        else:
-            if avg_prob < 0.45:
-                self.close()
+        # 简单的阈值策略 (Simple Threshold Strategy)
+        # 概率 > 0.55 -> 满仓
+        # 概率 < 0.45 -> 空仓
+        # 中间 -> 保持
+        
+        target_pct = None
+        
+        if avg_prob > 0.536190692289932:
+            target_pct = 0.99
+        elif avg_prob < 0.39220149920251607:
+            target_pct = 0.0
+            
+        if target_pct is not None:
+            # 强制整手交易 (100股/手)
+            # 计算目标市值
+            value = self.broker.get_value()
+            target_value = value * target_pct
+            price = self.data.close[0]
+            
+            if price > 0:
+                # 向下取整到 100 的倍数
+                target_size = int(target_value / price // 100) * 100
+            else:
+                target_size = 0
+                
+            self.order_target_size(target=target_size)
 
     @classmethod
     def train_model(cls, data_path):
@@ -134,11 +180,11 @@ class XGBoostStrategy(bt.Strategy):
         for i in range(n_models):
             seed = 42 + i
             model = xgb.XGBClassifier(
-                n_estimators=100,
-                learning_rate=0.01,
+                n_estimators=89,     # 增加树的数量，让模型学得更充分
+                learning_rate=0.020413194096776208,
                 max_depth=5,
-                subsample=0.8,
-                colsample_bytree=0.8,
+                subsample=0.8537022287782905,
+                colsample_bytree=0.7887832539836627,
                 random_state=seed,
                 eval_metric='logloss',
                 n_jobs=-1
